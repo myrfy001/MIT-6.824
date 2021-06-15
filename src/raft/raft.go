@@ -320,6 +320,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.VoteGranted = true
 			rf.votedFor = args.CandidateID
 			rf.votedForTerm = args.Term
+			rf.role = RaftRoleFollower
 			fmt.Println(rf.me, "Voted For A", args.CandidateID, "term", args.Term)
 			return
 		}
@@ -331,6 +332,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 				reply.VoteGranted = true
 				rf.votedFor = args.CandidateID
 				rf.votedForTerm = args.Term
+				rf.role = RaftRoleFollower
 				fmt.Println(rf.me, "Voted For B", args.CandidateID, "term", args.Term)
 			}
 		}
