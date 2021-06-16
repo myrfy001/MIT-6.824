@@ -67,14 +67,43 @@ type Raft struct {
 	// state a Raft server must maintain.
 
 	currentTerm int64
-	votedFor    int
+	votedFor    int64
 	commitIndex int64
 	lastApplied int64
 
-	role              string
-	nextVoteTimestamp int64
+	role                   string
+	nextVoteTimestamp      int64
 	nextHeartbeatTimestamp int64
+}
 
+func (rf *Raft) getCurrentTerm() int64 {
+	return atomic.LoadInt64(&rf.currentTerm)
+}
+func (rf *Raft) setTerm(newTerm int64) {
+	rf.setVotedFor(-1)
+	atomic.StoreInt64(&rf.currentTerm, newTerm)
+}
+func (rf *Raft) incTerm() {
+	rf.setVotedFor(-1)
+	atomic.AddInt64(&rf.currentTerm, 1)
+}
+
+func (rf *Raft) getVotedFor() int64 {
+	return atomic.LoadInt64(&rf.votedFor)
+}
+func (rf *Raft) setVotedFor(newVote int64) {
+	atomic.StoreInt64(&rf.votedFor, newVote)
+}
+
+func (rf *Raft) getRole() string {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.role
+}
+func (rf *Raft) setRole(newVote string) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.role = newVote
 }
 
 const (
@@ -92,7 +121,7 @@ func getNextVoteTimeoutTimestamp() int64 {
 }
 
 func getNextHeartbeatTimestamp() int64 {
-	return getCurrentTimestampMs() + 30 
+	return getCurrentTimestampMs() + 30
 }
 
 // return currentTerm and whether this server
@@ -103,8 +132,8 @@ func (rf *Raft) GetState() (int, bool) {
 	var isleader bool
 	// Your code here (2A).
 
-	term = int(rf.currentTerm)
-	isleader = rf.role == RoleLeader
+	term = int(rf.getCurrentTerm())
+	isleader = rf.getRole() == RoleLeader
 
 	return term, isleader
 }
@@ -173,10 +202,10 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term int64
-	CandidateId int
+	Term         int64
+	CandidateId  int64
 	LastLogIndex int64
-	LastLogTerm int64
+	LastLogTerm  int64
 }
 
 //
@@ -185,24 +214,23 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
-	Term int64
+	Term        int64
 	VoteGranted bool
 }
-
 
 type LogEntry struct{}
 
 type AppendEntriesArgs struct {
-	Term int64
-	LeaderID int
+	Term         int64
+	LeaderID     int
 	PrevLogIndex int64
-	PrevLogTerm int64
-	Entries []LogEntry
+	PrevLogTerm  int64
+	Entries      []LogEntry
 	LeaderCommit int64
 }
 
 type AppendEntriesReply struct {
-	Term int64
+	Term    int64
 	Success bool
 }
 
@@ -210,54 +238,52 @@ type AppendEntriesReply struct {
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+
 	// Your code here (2A, 2B).
 	reply.VoteGranted = false
-	reply.Term = rf.currentTerm
-	if args.Term < rf.currentTerm {
+	reply.Term = rf.getCurrentTerm()
+	if args.Term < rf.getCurrentTerm() {
 		return
 	}
 
-	if args.Term > rf.currentTerm {
+	if args.Term > rf.getCurrentTerm() {
 		rf.setTerm(args.Term)
-		reply.Term = rf.currentTerm
+		reply.Term = rf.getCurrentTerm()
 		rf.tryBecomeFollower(args.Term, int64(args.CandidateId))
 	}
 
-	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+	if rf.getVotedFor() == -1 || rf.getVotedFor() == args.CandidateId {
 		if rf.checkIfIncomeLogNotOld(args.LastLogTerm, args.LastLogIndex) {
 			reply.VoteGranted = true
-			rf.votedFor = args.CandidateId
+			rf.setVotedFor(args.CandidateId)
 		}
 	}
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-
 	reply.Success = false
-	reply.Term = rf.currentTerm
-	if args.Term < rf.currentTerm {
+	reply.Term = rf.getCurrentTerm()
+	if args.Term < rf.getCurrentTerm() {
 		return
 	}
 
-	if args.Term > rf.currentTerm {
+	if args.Term > rf.getCurrentTerm() {
 		rf.setTerm(args.Term)
-		reply.Term = rf.currentTerm
+		reply.Term = rf.getCurrentTerm()
 		rf.tryBecomeFollower(args.Term, int64(args.LeaderID))
 	}
 
-	rf.nextVoteTimestamp = getNextVoteTimeoutTimestamp()
+	atomic.StoreInt64(&rf.nextVoteTimestamp, getNextVoteTimeoutTimestamp())
 
-	if rf.role == RoleFollower || rf.role == RoleCandidate {
+	if rf.getRole() == RoleFollower || rf.getRole() == RoleCandidate {
 		reply.Success = true
-	} 
-	
+	}
 
 	// TODO Receiver implementation 2~5 行为逻辑
 
 }
 
-
-func (rf *Raft) checkIfIncomeLogNotOld(term int64, index int64) bool{
+func (rf *Raft) checkIfIncomeLogNotOld(term int64, index int64) bool {
 	myLastLogIdx := rf.getLastLogIndex()
 	myLastTerm := rf.getLogTermByIndex(myLastLogIdx)
 	if term > myLastTerm {
@@ -268,18 +294,6 @@ func (rf *Raft) checkIfIncomeLogNotOld(term int64, index int64) bool{
 
 	return false
 }
-
-func (rf *Raft) setTerm (newTerm int64) {
-	rf.votedFor = -1
-	rf.currentTerm = newTerm
-}
-
-func (rf *Raft) incTerm () {
-	rf.votedFor = -1
-	atomic.AddInt64(&rf.currentTerm, 1)
-}
-
-
 
 //
 // example code to send a RequestVote RPC to a server.
@@ -311,13 +325,13 @@ func (rf *Raft) incTerm () {
 // the struct itself.
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	DPrintf("%d Send sendRequestVote to %d At term %d\n", rf.me, server, rf.currentTerm)
+	DPrintf("%d Send sendRequestVote to %d At term %d\n", rf.me, server, rf.getCurrentTerm())
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	DPrintf("%d Send sendAppendEntries to %d At term %d\n", rf.me, server, rf.currentTerm)
+	DPrintf("%d Send sendAppendEntries to %d At term %d\n", rf.me, server, rf.getCurrentTerm())
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
@@ -382,7 +396,7 @@ func (rf *Raft) ticker() {
 		} else {
 			atomic.StoreInt64(&rf.nextVoteTimestamp, getNextVoteTimeoutTimestamp())
 		}
-		if rf.role == RoleLeader { // Candidate模式下，第一次发出去的选票可能没有结果，所以Candidate超时了也要重新发起选举
+		if rf.getRole() == RoleLeader { // Candidate模式下，第一次发出去的选票可能没有结果，所以Candidate超时了也要重新发起选举
 			continue
 		}
 
@@ -400,7 +414,7 @@ func (rf *Raft) heartbeatTicker() {
 		} else {
 			atomic.StoreInt64(&rf.nextHeartbeatTimestamp, getNextHeartbeatTimestamp())
 		}
-		if rf.role == RoleFollower || rf.role == RoleCandidate {
+		if rf.getRole() == RoleFollower || rf.getRole() == RoleCandidate {
 			continue
 		}
 
@@ -408,32 +422,31 @@ func (rf *Raft) heartbeatTicker() {
 	}
 }
 
-
 func (rf *Raft) doElection() {
-	rf.role = RoleCandidate
+	rf.setRole(RoleCandidate)
 	rf.incTerm()
-	rf.votedFor = rf.me
+	rf.setVotedFor(int64(rf.me))
 
 	recvVoteCnt := int64(1)
-	for i:=0; i<len(rf.peers); i++ {
+	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
 		}
 
 		go func(idx int) {
-			args := RequestVoteArgs {
-				Term: rf.currentTerm,
-				CandidateId: rf.me,
+			args := RequestVoteArgs{
+				Term:         rf.getCurrentTerm(),
+				CandidateId:  int64(rf.me),
 				LastLogIndex: rf.getLastLogIndex(),
-				LastLogTerm: rf.getLogTermByIndex(rf.getLastLogIndex()),
+				LastLogTerm:  rf.getLogTermByIndex(rf.getLastLogIndex()),
 			}
 			reply := RequestVoteReply{}
 			rf.sendRequestVote(idx, &args, &reply)
 			if reply.VoteGranted {
 				newCnt := atomic.AddInt64(&recvVoteCnt, 1)
-				DPrintf("\033[33m%d Recv Vote From %d At term %d\033[0m\n", rf.me, idx, rf.currentTerm)
-				if newCnt > int64(len(rf.peers)) / 2 {
-					DPrintf("\033[31m%d Win Election At term %d\033[0m\n", rf.me, rf.currentTerm)
+				DPrintf("\033[33m%d Recv Vote From %d At term %d\033[0m\n", rf.me, idx, rf.getCurrentTerm())
+				if newCnt > int64(len(rf.peers))/2 {
+					DPrintf("\033[31m%d Win Election At term %d\033[0m\n", rf.me, rf.getCurrentTerm())
 					rf.tryBecomeLeader(reply.Term)
 					go rf.broadcastHeartbeat()
 				}
@@ -443,47 +456,45 @@ func (rf *Raft) doElection() {
 }
 
 func (rf *Raft) tryBecomeLeader(term int64) {
-	if term < rf.currentTerm || term > rf.currentTerm{
-		return 
-	}
-	if rf.role == RoleLeader {
+	if term < rf.getCurrentTerm() || term > rf.getCurrentTerm() {
 		return
 	}
-	rf.role = RoleLeader
+	if rf.getRole() == RoleLeader {
+		return
+	}
+	rf.setRole(RoleLeader)
 }
 
 func (rf *Raft) tryBecomeFollower(term int64, triggerSrorce int64) {
-	if term < rf.currentTerm || term > rf.currentTerm{
-		return 
-	}
-	if rf.role == RoleFollower {
+	if term < rf.getCurrentTerm() || term > rf.getCurrentTerm() {
 		return
 	}
-	if rf.role != RoleFollower {
-		DPrintf("\033[31m[***] %d Turn To Follower From State %s At term %d, Because Server %d\033[0m\n", rf.me, rf.role, rf.currentTerm, triggerSrorce)
-		rf.role = RoleFollower
+	if rf.getRole() == RoleFollower {
+		return
+	}
+	if rf.getRole() != RoleFollower {
+		DPrintf("\033[31m[***] %d Turn To Follower From State %s At term %d, Because Server %d\033[0m\n", rf.me, rf.getRole(), rf.getCurrentTerm(), triggerSrorce)
+		rf.setRole(RoleFollower)
 	}
 }
 
-
-
 func (rf *Raft) broadcastHeartbeat() {
-	for i:=0; i<len(rf.peers); i++ {
+	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
 		}
 
 		go func(idx int) {
-			args := AppendEntriesArgs {
-				Term: rf.currentTerm,
-				LeaderID: rf.me,
+			args := AppendEntriesArgs{
+				Term:         rf.getCurrentTerm(),
+				LeaderID:     rf.me,
 				PrevLogIndex: rf.getLastLogIndex(),
-				PrevLogTerm: rf.getLogTermByIndex(rf.getLastLogIndex()),
+				PrevLogTerm:  rf.getLogTermByIndex(rf.getLastLogIndex()),
 				LeaderCommit: rf.commitIndex,
 			}
 			reply := AppendEntriesReply{}
 			rf.sendAppendEntries(idx, &args, &reply)
-			if reply.Term > rf.currentTerm {
+			if reply.Term > rf.getCurrentTerm() {
 				rf.setTerm(reply.Term)
 				rf.tryBecomeFollower(reply.Term, int64(idx))
 			}
@@ -518,12 +529,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.nextVoteTimestamp = getNextVoteTimeoutTimestamp()
-	rf.nextHeartbeatTimestamp = getNextHeartbeatTimestamp()
-	rf.role = RoleFollower
-
-
-
+	atomic.StoreInt64(&rf.nextVoteTimestamp,  getNextVoteTimeoutTimestamp())
+	atomic.StoreInt64(&rf.nextHeartbeatTimestamp, getNextHeartbeatTimestamp())
+	rf.setRole(RoleFollower)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
