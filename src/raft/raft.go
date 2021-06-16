@@ -71,16 +71,16 @@ type Raft struct {
 	commitIndex int64
 	lastApplied int64
 
-	role              int32
+	role              string
 	nextVoteTimestamp int64
 	nextHeartbeatTimestamp int64
 
 }
 
 const (
-	RoleLeader    = int32(1)
-	RoleFollower  = int32(2)
-	RoleCandidate = int32(3)
+	RoleLeader    = "leader"
+	RoleFollower  = "follower"
+	RoleCandidate = "candidate"
 )
 
 func getCurrentTimestampMs() int64 {
@@ -220,11 +220,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term > rf.currentTerm {
 		rf.setTerm(args.Term)
 		reply.Term = rf.currentTerm
+		rf.tryBecomeFollower(args.Term, int64(args.CandidateId))
 	}
 
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
 		if rf.checkIfIncomeLogNotOld(args.LastLogTerm, args.LastLogIndex) {
 			reply.VoteGranted = true
+			rf.votedFor = args.CandidateId
 		}
 	}
 }
@@ -240,7 +242,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term > rf.currentTerm {
 		rf.setTerm(args.Term)
 		reply.Term = rf.currentTerm
-		rf.tryBecomeFollower(args.Term)
+		rf.tryBecomeFollower(args.Term, int64(args.LeaderID))
 	}
 
 	rf.nextVoteTimestamp = getNextVoteTimeoutTimestamp()
@@ -429,8 +431,9 @@ func (rf *Raft) doElection() {
 			rf.sendRequestVote(idx, &args, &reply)
 			if reply.VoteGranted {
 				newCnt := atomic.AddInt64(&recvVoteCnt, 1)
+				DPrintf("\033[33m%d Recv Vote From %d At term %d\033[0m\n", rf.me, idx, rf.currentTerm)
 				if newCnt > int64(len(rf.peers)) / 2 {
-					DPrintf("[***] %d Win Election At term %d\n", rf.me, rf.currentTerm)
+					DPrintf("\033[31m%d Win Election At term %d\033[0m\n", rf.me, rf.currentTerm)
 					rf.tryBecomeLeader(reply.Term)
 					go rf.broadcastHeartbeat()
 				}
@@ -449,14 +452,17 @@ func (rf *Raft) tryBecomeLeader(term int64) {
 	rf.role = RoleLeader
 }
 
-func (rf *Raft) tryBecomeFollower(term int64) {
+func (rf *Raft) tryBecomeFollower(term int64, triggerSrorce int64) {
 	if term < rf.currentTerm || term > rf.currentTerm{
 		return 
 	}
 	if rf.role == RoleFollower {
 		return
 	}
-	rf.role = RoleFollower
+	if rf.role != RoleFollower {
+		DPrintf("\033[31m[***] %d Turn To Follower From State %s At term %d, Because Server %d\033[0m\n", rf.me, rf.role, rf.currentTerm, triggerSrorce)
+		rf.role = RoleFollower
+	}
 }
 
 
@@ -478,7 +484,8 @@ func (rf *Raft) broadcastHeartbeat() {
 			reply := AppendEntriesReply{}
 			rf.sendAppendEntries(idx, &args, &reply)
 			if reply.Term > rf.currentTerm {
-				rf.tryBecomeFollower(reply.Term)
+				rf.setTerm(reply.Term)
+				rf.tryBecomeFollower(reply.Term, int64(idx))
 			}
 		}(i)
 	}
