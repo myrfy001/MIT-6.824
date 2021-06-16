@@ -380,7 +380,7 @@ func (rf *Raft) ticker() {
 		} else {
 			atomic.StoreInt64(&rf.nextVoteTimestamp, getNextVoteTimeoutTimestamp())
 		}
-		if rf.role == RoleLeader || rf.role == RoleCandidate {
+		if rf.role == RoleLeader { // Candidate模式下，第一次发出去的选票可能没有结果，所以Candidate超时了也要重新发起选举
 			continue
 		}
 
