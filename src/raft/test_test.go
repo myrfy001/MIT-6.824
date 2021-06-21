@@ -139,15 +139,19 @@ func TestBasicAgree2B(t *testing.T) {
 
 	iters := 3
 	for index := 1; index < iters+1; index++ {
+		fmt.Println("===== TestBasicAgree2B round:", index)
 		nd, _ := cfg.nCommitted(index)
 		if nd > 0 {
 			t.Fatalf("some have committed before Start()")
 		}
 
+		fmt.Println("===== TestBasicAgree2B step 2")
+
 		xindex := cfg.one(index*100, servers, false)
 		if xindex != index {
 			t.Fatalf("got index %v but expected %v", xindex, index)
 		}
+		fmt.Println("===== TestBasicAgree2B step 3")
 	}
 
 	cfg.end()

@@ -20,6 +20,7 @@ package raft
 import (
 	//	"bytes"
 
+	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -66,6 +67,10 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	logs       []*LogEntry
+	nextIndex  []int64
+	matchIndex []int64
+
 	currentTerm int64
 	votedFor    int64
 	commitIndex int64
@@ -74,6 +79,7 @@ type Raft struct {
 	role                   string
 	nextVoteTimestamp      int64
 	nextHeartbeatTimestamp int64
+	applyCh chan ApplyMsg
 }
 
 func (rf *Raft) getCurrentTerm() int64 {
@@ -103,8 +109,72 @@ func (rf *Raft) getRole() string {
 func (rf *Raft) setRole(newVote string) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	for i := 0; i < len(rf.peers); i++ {
+		rf.setNextIndex(int64(i), rf.getLastLogIndex(false)+1)
+		rf.setMatchIndex(int64(i), 0)
+	}
+
 	rf.role = newVote
 }
+
+func (rf *Raft) getNextIndex(peer int64) int64 {
+	return atomic.LoadInt64(&rf.nextIndex[peer])
+}
+
+func (rf *Raft) setNextIndex(peer int64, val int64) {
+	atomic.StoreInt64(&rf.nextIndex[peer], val)
+}
+
+func (rf *Raft) getMatchIndex(peer int64) int64 {
+	return atomic.LoadInt64(&rf.matchIndex[peer])
+}
+
+func (rf *Raft) setMatchIndex(peer int64, val int64) {
+	atomic.StoreInt64(&rf.matchIndex[peer], val)
+}
+
+func (rf *Raft) getLastApplyID() int64 {
+	return atomic.LoadInt64(&rf.lastApplied)
+}
+
+func (rf *Raft) setLastApplyID(val int64) {
+	atomic.StoreInt64(&rf.lastApplied, val)
+}
+
+func (rf *Raft) getLogSlice(idx, cnt int64, lock bool) []LogEntry {
+	if lock {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+	}
+	ret := make([]LogEntry, 0, cnt)
+	n := idx+cnt
+	if n > int64(len(rf.logs)) {
+		n = int64(len(rf.logs))
+	}
+	for _, item := range rf.logs[idx : n] {
+		ret = append(ret, *item)
+	}
+	return ret
+}
+
+func (rf *Raft) getCommitIndex() int64 {
+	return atomic.LoadInt64(&rf.commitIndex)
+}
+
+func (rf *Raft) setCommitIndex(val int64) {
+	atomic.StoreInt64(&rf.commitIndex, val)
+}
+
+func (rf *Raft) getLogByIndex(idx int64, lock bool) *LogEntry{
+	if lock {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+	}
+	return rf.logs[idx]
+}
+
+
 
 const (
 	RoleLeader    = "leader"
@@ -218,7 +288,11 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
-type LogEntry struct{}
+type LogEntry struct {
+	Data  interface{}
+	Term  int64
+	Index int64
+}
 
 type AppendEntriesArgs struct {
 	Term         int64
@@ -275,17 +349,39 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	atomic.StoreInt64(&rf.nextVoteTimestamp, getNextVoteTimeoutTimestamp())
 
-	if rf.getRole() == RoleFollower || rf.getRole() == RoleCandidate {
-		reply.Success = true
+
+	myPrevLog := rf.getLogByIndex(args.PrevLogIndex, true)
+	if myPrevLog == nil {
+		return 
+	}
+	if myPrevLog.Term != args.PrevLogTerm {
+		return
 	}
 
-	// TODO Receiver implementation 2~5 行为逻辑
+	// 走到这里，就可以回复true了
+	reply.Success = true
+
+	rf.removeLogStartFromIdx(args.PrevLogIndex + 1, true)
+
+	for i := range args.Entries{
+		rf.appendLogByReceivedLog(&args.Entries[i])
+	}
+	
+
+	rf.mu.Lock()
+	newCommitIdx := args.LeaderCommit
+	maxIndexOfMyselfLog := rf.getLastLogIndex(false)
+	if maxIndexOfMyselfLog < newCommitIdx {
+		newCommitIdx = maxIndexOfMyselfLog
+	}
+	rf.setCommitIndex(newCommitIdx)
+	rf.mu.Unlock()
 
 }
 
 func (rf *Raft) checkIfIncomeLogNotOld(term int64, index int64) bool {
-	myLastLogIdx := rf.getLastLogIndex()
-	myLastTerm := rf.getLogTermByIndex(myLastLogIdx)
+	myLastLogIdx := rf.getLastLogIndex(true)
+	myLastTerm := rf.getLogTermByIndex(myLastLogIdx, true)
 	if term > myLastTerm {
 		return true
 	} else if term == myLastTerm && index >= myLastLogIdx {
@@ -331,7 +427,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	DPrintf("%d Send sendAppendEntries to %d At term %d\n", rf.me, server, rf.getCurrentTerm())
+	DPrintf("%d Send sendAppendEntries to %d At term %d log cnt %d\n", rf.me, server, rf.getCurrentTerm(), len(args.Entries))
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
@@ -353,12 +449,58 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
-	isLeader := true
+	isLeader := rf.getRole() == RoleLeader
 
 	// Your code here (2B).
 
+	if !isLeader {
+		return index, term, isLeader
+	}
+
+	index = int(rf.appendLogByData(command))
+
+	term = int(rf.getCurrentTerm())
+
 	return index, term, isLeader
 }
+
+func (rf *Raft) appendLogByData(data interface{}) int64 {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	newIdx := rf.getLastLogIndex(false) + 1
+
+	log := LogEntry{
+		Data:  data,
+		Term:  rf.getCurrentTerm(),
+		Index: newIdx,
+	}
+
+	rf.logs = append(rf.logs, &log)
+
+	return newIdx
+}
+
+func (rf *Raft) appendLogByReceivedLog(data *LogEntry) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	rf.logs = append(rf.logs, data)
+
+}
+
+
+
+// removeLogStartFromIdx 从idx开始删除，以及后面的日志，idx也删掉
+func (rf *Raft) removeLogStartFromIdx(idx int64, lock bool) {
+	if lock {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+	}
+
+	rf.logs = rf.logs[:idx]
+}
+
 
 //
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -422,6 +564,113 @@ func (rf *Raft) heartbeatTicker() {
 	}
 }
 
+func (rf *Raft) logReplicaWorker(peer int64) {
+	for rf.killed() == false {
+		time.Sleep(1 * time.Millisecond)
+		if rf.getRole() != RoleLeader {
+			
+			continue
+		}
+
+		// nextIdx = 0 是一个dummy项，正经的日志都是从1开始的
+		nextIdx := rf.getNextIndex(peer)
+		if nextIdx > rf.getLastLogIndex(true) {
+			continue
+		}
+		entries := rf.getLogSlice(nextIdx-1, 101, true)
+		if len(entries) == 0 {
+			continue
+		}
+		args := AppendEntriesArgs{
+			Term:         rf.getCurrentTerm(),
+			LeaderID:     rf.me,
+			PrevLogIndex: entries[0].Index,
+			PrevLogTerm:  entries[0].Term,
+			Entries:      entries[1:],
+			LeaderCommit: rf.getCommitIndex(),
+		}
+		reply := AppendEntriesReply{}
+		rf.sendAppendEntries(int(peer), &args, &reply)
+
+		if reply.Term > rf.getCurrentTerm() {
+			rf.setTerm(reply.Term)
+			rf.tryBecomeFollower(reply.Term, peer)
+			continue
+		}
+
+		if reply.Success {
+			rf.setNextIndex(peer, nextIdx+int64(len(entries)-1))
+			rf.setMatchIndex(peer, nextIdx+int64(len(entries)-1))
+		} else {
+			if nextIdx > 0 {
+				rf.setNextIndex(peer, nextIdx-1)
+			} else {
+				panic(fmt.Sprintf("nextIndex for peer %d reach 0", peer))
+			}
+		}
+	}
+}
+
+func (rf *Raft) logCommitWorker() {
+	for rf.killed() == false {
+		time.Sleep(1 * time.Millisecond)
+		if rf.getRole() != RoleLeader {
+			continue
+		}
+
+		nowCommited := rf.getCommitIndex()
+		quorum := len(rf.peers) / 2
+
+		n := rf.getLastLogIndex(true)
+
+		brk:
+		for n > nowCommited {
+			cnt := 1
+			for peer :=0; peer < len(rf.peers); peer++ {
+				if rf.getMatchIndex(int64(peer)) > n {
+					cnt++
+				}
+				if cnt > quorum {
+					log := rf.getLogByIndex(n, true)
+					if log == nil {
+						// 说明log不存在，可能是已经被压缩了，说明n退的太靠前了， 理论上不应该出现
+						panic(fmt.Sprintf("No log at index %d", n))
+					}
+					if log.Term != rf.getCurrentTerm() {
+						// 已经读到了前一任的日志了，n退的太多了，leader只能commit自己的日志
+						break brk
+					}
+					rf.setCommitIndex(n)
+					break brk
+				}
+			}
+			n--
+		}
+	}
+}
+
+
+
+func (rf *Raft) applyMsgWorker() {
+	for {
+		time.Sleep(1 * time.Millisecond)
+		newCommitIdx := rf.getCommitIndex()
+		// 下面循环的初始条件的+1是为了避免对idx=0的判断
+		for i:= rf.getLastApplyID()+1; i<=newCommitIdx; i++ {
+			log := rf.getLogByIndex(i, true)
+			if log == nil {
+				panic("Get log which is nil")
+			}
+			rf.applyCh <- ApplyMsg{
+				CommandValid: true,
+				Command: log.Data,
+				CommandIndex: int(log.Index),
+			}
+			rf.setLastApplyID(i)
+		}
+	}
+}
+
 func (rf *Raft) doElection() {
 	rf.setRole(RoleCandidate)
 	rf.incTerm()
@@ -437,8 +686,8 @@ func (rf *Raft) doElection() {
 			args := RequestVoteArgs{
 				Term:         rf.getCurrentTerm(),
 				CandidateId:  int64(rf.me),
-				LastLogIndex: rf.getLastLogIndex(),
-				LastLogTerm:  rf.getLogTermByIndex(rf.getLastLogIndex()),
+				LastLogIndex: rf.getLastLogIndex(true),
+				LastLogTerm:  rf.getLogTermByIndex(rf.getLastLogIndex(true), true),
 			}
 			reply := RequestVoteReply{}
 			rf.sendRequestVote(idx, &args, &reply)
@@ -488,8 +737,8 @@ func (rf *Raft) broadcastHeartbeat() {
 			args := AppendEntriesArgs{
 				Term:         rf.getCurrentTerm(),
 				LeaderID:     rf.me,
-				PrevLogIndex: rf.getLastLogIndex(),
-				PrevLogTerm:  rf.getLogTermByIndex(rf.getLastLogIndex()),
+				PrevLogIndex: rf.getLastLogIndex(true),
+				PrevLogTerm:  rf.getLogTermByIndex(rf.getLastLogIndex(true), true),
 				LeaderCommit: rf.commitIndex,
 			}
 			reply := AppendEntriesReply{}
@@ -502,12 +751,22 @@ func (rf *Raft) broadcastHeartbeat() {
 	}
 }
 
-func (rf *Raft) getLastLogIndex() int64 {
-	return 0
+func (rf *Raft) getLastLogIndex(lock bool) int64 {
+	if lock {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+	}
+
+	return int64(len(rf.logs)) - 1
 }
 
-func (rf *Raft) getLogTermByIndex(idx int64) int64 {
-	return 0
+func (rf *Raft) getLogTermByIndex(idx int64, lock bool) int64 {
+	if lock {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+	}
+
+	return rf.logs[idx].Term
 }
 
 //
@@ -529,9 +788,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	atomic.StoreInt64(&rf.nextVoteTimestamp,  getNextVoteTimeoutTimestamp())
+	rf.applyCh = applyCh
+	atomic.StoreInt64(&rf.nextVoteTimestamp, getNextVoteTimeoutTimestamp())
 	atomic.StoreInt64(&rf.nextHeartbeatTimestamp, getNextHeartbeatTimestamp())
+	rf.matchIndex = make([]int64, len(peers))
+	rf.nextIndex = make([]int64, len(peers))
 	rf.setRole(RoleFollower)
+	// 这里追加一条空日志，占据logs下标为0的位置，作为dummy head 简化后续代码。实际raft的log都是从idx=1开始的
+	rf.logs = append(rf.logs, &LogEntry{})
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -539,6 +803,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// start ticker goroutine to start elections
 	go rf.ticker()
 	go rf.heartbeatTicker()
+	go rf.logCommitWorker()
+	go rf.applyMsgWorker()
+	for i:=0; i<len(peers); i++ {
+		if i != me {
+			go rf.logReplicaWorker(int64(i))
+		}
+	}
 
 	return rf
 }
