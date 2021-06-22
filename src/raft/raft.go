@@ -123,6 +123,9 @@ func (rf *Raft) getNextIndex(peer int64) int64 {
 }
 
 func (rf *Raft) setNextIndex(peer int64, val int64) {
+	if val == 0 {
+		fmt.Println("1111")
+	}
 	atomic.StoreInt64(&rf.nextIndex[peer], val)
 }
 
@@ -171,6 +174,9 @@ func (rf *Raft) getLogByIndex(idx int64, lock bool) *LogEntry{
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
 	}
+	if idx > rf.getLastLogIndex(false) {
+		return nil
+	}
 	return rf.logs[idx]
 }
 
@@ -187,11 +193,11 @@ func getCurrentTimestampMs() int64 {
 }
 
 func getNextVoteTimeoutTimestamp() int64 {
-	return getCurrentTimestampMs() + 100 + rand.Int63n(100)
+	return getCurrentTimestampMs() + 120 + rand.Int63n(100)
 }
 
 func getNextHeartbeatTimestamp() int64 {
-	return getCurrentTimestampMs() + 30
+	return getCurrentTimestampMs() + 40
 }
 
 // return currentTerm and whether this server
@@ -568,7 +574,6 @@ func (rf *Raft) logReplicaWorker(peer int64) {
 	for rf.killed() == false {
 		time.Sleep(1 * time.Millisecond)
 		if rf.getRole() != RoleLeader {
-			
 			continue
 		}
 
@@ -602,8 +607,11 @@ func (rf *Raft) logReplicaWorker(peer int64) {
 			rf.setNextIndex(peer, nextIdx+int64(len(entries)-1))
 			rf.setMatchIndex(peer, nextIdx+int64(len(entries)-1))
 		} else {
-			if nextIdx > 0 {
+			if nextIdx > 1 {
 				rf.setNextIndex(peer, nextIdx-1)
+			} else if nextIdx == 1{
+				// 针对1的特殊处理，否则会导致TestBackup2B失败
+				continue
 			} else {
 				panic(fmt.Sprintf("nextIndex for peer %d reach 0", peer))
 			}
@@ -793,9 +801,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	atomic.StoreInt64(&rf.nextHeartbeatTimestamp, getNextHeartbeatTimestamp())
 	rf.matchIndex = make([]int64, len(peers))
 	rf.nextIndex = make([]int64, len(peers))
-	rf.setRole(RoleFollower)
 	// 这里追加一条空日志，占据logs下标为0的位置，作为dummy head 简化后续代码。实际raft的log都是从idx=1开始的
 	rf.logs = append(rf.logs, &LogEntry{})
+	rf.setRole(RoleFollower)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
