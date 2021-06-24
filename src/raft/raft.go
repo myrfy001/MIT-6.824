@@ -20,6 +20,8 @@ package raft
 import (
 	//	"bytes"
 
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"math/rand"
 	"sync"
@@ -27,6 +29,7 @@ import (
 	"time"
 
 	//	"6.824/labgob"
+	"6.824/src/labgob"
 	"6.824/src/labrpc"
 )
 
@@ -62,6 +65,7 @@ type Raft struct {
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
+	id        time.Time
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -79,7 +83,7 @@ type Raft struct {
 	role                   string
 	nextVoteTimestamp      int64
 	nextHeartbeatTimestamp int64
-	applyCh chan ApplyMsg
+	applyCh                chan ApplyMsg
 }
 
 func (rf *Raft) getCurrentTerm() int64 {
@@ -101,15 +105,18 @@ func (rf *Raft) setVotedFor(newVote int64) {
 	atomic.StoreInt64(&rf.votedFor, newVote)
 }
 
-func (rf *Raft) getRole() string {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+func (rf *Raft) getRole(lock bool) string {
+	if lock {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+	}
 	return rf.role
 }
-func (rf *Raft) setRole(newVote string) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
+func (rf *Raft) setRole(newVote string, lock bool) {
+	if lock {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+	}
 	for i := 0; i < len(rf.peers); i++ {
 		rf.setNextIndex(int64(i), rf.getLastLogIndex(false)+1)
 		rf.setMatchIndex(int64(i), 0)
@@ -123,9 +130,6 @@ func (rf *Raft) getNextIndex(peer int64) int64 {
 }
 
 func (rf *Raft) setNextIndex(peer int64, val int64) {
-	if val == 0 {
-		fmt.Println("1111")
-	}
 	atomic.StoreInt64(&rf.nextIndex[peer], val)
 }
 
@@ -151,11 +155,11 @@ func (rf *Raft) getLogSlice(idx, cnt int64, lock bool) []LogEntry {
 		defer rf.mu.Unlock()
 	}
 	ret := make([]LogEntry, 0, cnt)
-	n := idx+cnt
+	n := idx + cnt
 	if n > int64(len(rf.logs)) {
 		n = int64(len(rf.logs))
 	}
-	for _, item := range rf.logs[idx : n] {
+	for _, item := range rf.logs[idx:n] {
 		ret = append(ret, *item)
 	}
 	return ret
@@ -169,7 +173,7 @@ func (rf *Raft) setCommitIndex(val int64) {
 	atomic.StoreInt64(&rf.commitIndex, val)
 }
 
-func (rf *Raft) getLogByIndex(idx int64, lock bool) *LogEntry{
+func (rf *Raft) getLogByIndex(idx int64, lock bool) *LogEntry {
 	if lock {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
@@ -179,8 +183,6 @@ func (rf *Raft) getLogByIndex(idx int64, lock bool) *LogEntry{
 	}
 	return rf.logs[idx]
 }
-
-
 
 const (
 	RoleLeader    = "leader"
@@ -209,7 +211,7 @@ func (rf *Raft) GetState() (int, bool) {
 	// Your code here (2A).
 
 	term = int(rf.getCurrentTerm())
-	isleader = rf.getRole() == RoleLeader
+	isleader = rf.getRole(true) == RoleLeader
 
 	return term, isleader
 }
@@ -219,7 +221,7 @@ func (rf *Raft) GetState() (int, bool) {
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
 //
-func (rf *Raft) persist() {
+func (rf *Raft) persist(lock bool) {
 	// Your code here (2C).
 	// Example:
 	// w := new(bytes.Buffer)
@@ -228,6 +230,20 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+	if lock {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+	}
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.logs)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
+
+	// logs, _ := json.Marshal(rf.logs)
+	// DPrintf("%d persist at term %d: %s", rf.me, rf.getCurrentTerm(), string(logs))
 }
 
 //
@@ -250,6 +266,27 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var curTerm = int64(0)
+	var votedFor = int64(0)
+	var logs = []*LogEntry{}
+
+	if d.Decode(&curTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&logs) != nil {
+		panic("readPersist Error")
+	} else {
+		rf.currentTerm = curTerm
+		rf.votedFor = votedFor
+		rf.logs = logs
+
+		logs, _ := json.Marshal(rf.logs)
+		DPrintf("%d readpersist at term %d: %s", rf.me, rf.getCurrentTerm(), string(logs))
+
+	}
+
 }
 
 //
@@ -318,7 +355,6 @@ type AppendEntriesReply struct {
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-
 	// Your code here (2A, 2B).
 	reply.VoteGranted = false
 	reply.Term = rf.getCurrentTerm()
@@ -326,18 +362,25 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
+	defer rf.persist(true)
+
 	if args.Term > rf.getCurrentTerm() {
-		rf.setTerm(args.Term)
+		rf.tryBecomeFollowerAndUpdateTerm(args.Term, int64(args.CandidateId), true)
 		reply.Term = rf.getCurrentTerm()
-		rf.tryBecomeFollower(args.Term, int64(args.CandidateId))
+		DPrintf("\033[35m%d Update To Term %d because RV Request From %d\033[0m\n", rf.me, args.Term, args.CandidateId)
 	}
 
 	if rf.getVotedFor() == -1 || rf.getVotedFor() == args.CandidateId {
 		if rf.checkIfIncomeLogNotOld(args.LastLogTerm, args.LastLogIndex) {
 			reply.VoteGranted = true
 			rf.setVotedFor(args.CandidateId)
+
+			myLastLogIdx := rf.getLastLogIndex(true)
+			myLastTerm := rf.getLogTermByIndex(myLastLogIdx, true)
+			DPrintf("\033[31m%d Give Vote To %d, myT: %d, myI: %d, InT: %d, InI: %d\033[0m\n", rf.me, args.CandidateId, myLastTerm, myLastLogIdx, args.LastLogTerm, args.LastLogIndex)
 		}
 	}
+
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -347,18 +390,24 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
+	defer rf.persist(true)
+
 	if args.Term > rf.getCurrentTerm() {
-		rf.setTerm(args.Term)
+		rf.tryBecomeFollowerAndUpdateTerm(args.Term, int64(args.LeaderID), true)
 		reply.Term = rf.getCurrentTerm()
-		rf.tryBecomeFollower(args.Term, int64(args.LeaderID))
+		DPrintf("\033[35m%d Update To Term %d because AE Request from %d\033[0m\n", rf.me, args.Term, args.LeaderID)
+	}
+
+	if rf.getRole(true) == RoleLeader {
+		DPrintf("\033[35m%d is leader now but receive AE from %d with term %d, ignore\033[0m\n", rf.me, args.LeaderID, args.Term)
+		return
 	}
 
 	atomic.StoreInt64(&rf.nextVoteTimestamp, getNextVoteTimeoutTimestamp())
 
-
 	myPrevLog := rf.getLogByIndex(args.PrevLogIndex, true)
 	if myPrevLog == nil {
-		return 
+		return
 	}
 	if myPrevLog.Term != args.PrevLogTerm {
 		return
@@ -367,12 +416,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 走到这里，就可以回复true了
 	reply.Success = true
 
-	rf.removeLogStartFromIdx(args.PrevLogIndex + 1, true)
+	rf.removeLogStartFromIdx(args.PrevLogIndex+1, true)
 
-	for i := range args.Entries{
+	for i := range args.Entries {
 		rf.appendLogByReceivedLog(&args.Entries[i])
 	}
-	
 
 	rf.mu.Lock()
 	newCommitIdx := args.LeaderCommit
@@ -383,6 +431,33 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.setCommitIndex(newCommitIdx)
 	rf.mu.Unlock()
 
+}
+
+func (rf *Raft) tryBecomeFollowerAndUpdateTerm(term int64, triggerSrorce int64, lock bool) {
+	// 当发现比自己更大的term时，更新自己的term和切换到follower必须是一个事务
+	// 同时，Leader在发送AE前，检查自己是不是Leader以及确定自己发送的AE的Term这件事，也必须是一个事务
+	// 避免先检查自己是Leader以后，到真正发送AE之间，自己的Term被更新，导致自己的Log是老的，但是自己的Term是新的，自己拿着最新的Term去骗人
+	// 可能发生的情况是，Leader断网后，自己一直没有更新，并且一直认为自己还是Leader，网络恢复后，Leader的日志已经落后，但是收到别人的HeartBeat以后，
+	// 先更新了自己的Term, 然后设置自己的角色为Follower，在这个间隙中（Term已经更新，但是角色还是Leader）时，就可能以Leader的身份和最新的Term向外发送消息
+	// 从而干扰其他peer
+	if lock {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+	}
+	rf.setTerm(term)
+	rf.tryBecomeFollower(term, triggerSrorce, false)
+}
+
+func (rf *Raft) checkLeaderAndGetCurrentTerm(lock bool) int64 {
+	// 参见tryBecomeFollowerAndUpdateTerm的注释
+	if lock {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+	}
+	if rf.getRole(false) != RoleLeader {
+		return -1
+	}
+	return rf.getCurrentTerm()
 }
 
 func (rf *Raft) checkIfIncomeLogNotOld(term int64, index int64) bool {
@@ -433,7 +508,10 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	DPrintf("%d Send sendAppendEntries to %d At term %d log cnt %d\n", rf.me, server, rf.getCurrentTerm(), len(args.Entries))
+	if len(args.Entries) > 0 {
+		DPrintf("%d Send sendAppendEntries to %d At term %d log cnt %d id %v\n", rf.me, server, rf.getCurrentTerm(), len(args.Entries), rf.id)
+	}
+
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
@@ -453,9 +531,11 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	index := -1
 	term := -1
-	isLeader := rf.getRole() == RoleLeader
+	isLeader := rf.getRole(false) == RoleLeader
 
 	// Your code here (2B).
 
@@ -463,16 +543,22 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return index, term, isLeader
 	}
 
-	index = int(rf.appendLogByData(command))
+	index = int(rf.appendLogByData(command, false))
 
 	term = int(rf.getCurrentTerm())
+
+	rf.persist(false)
+
+	DPrintf("\033[32m%d client add log %d term %d value %v\033[0m\n", rf.me, index, term, command)
 
 	return index, term, isLeader
 }
 
-func (rf *Raft) appendLogByData(data interface{}) int64 {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+func (rf *Raft) appendLogByData(data interface{}, lock bool) int64 {
+	if lock {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+	}
 
 	newIdx := rf.getLastLogIndex(false) + 1
 
@@ -495,8 +581,6 @@ func (rf *Raft) appendLogByReceivedLog(data *LogEntry) {
 
 }
 
-
-
 // removeLogStartFromIdx 从idx开始删除，以及后面的日志，idx也删掉
 func (rf *Raft) removeLogStartFromIdx(idx int64, lock bool) {
 	if lock {
@@ -504,9 +588,12 @@ func (rf *Raft) removeLogStartFromIdx(idx int64, lock bool) {
 		defer rf.mu.Unlock()
 	}
 
+	oldLen := len(rf.logs)
 	rf.logs = rf.logs[:idx]
+	if len(rf.logs) != oldLen {
+		DPrintf("\033[34m%d remove log after log idx %d\033[0m\n", rf.me, len(rf.logs)-1)
+	}
 }
-
 
 //
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -544,7 +631,7 @@ func (rf *Raft) ticker() {
 		} else {
 			atomic.StoreInt64(&rf.nextVoteTimestamp, getNextVoteTimeoutTimestamp())
 		}
-		if rf.getRole() == RoleLeader { // Candidate模式下，第一次发出去的选票可能没有结果，所以Candidate超时了也要重新发起选举
+		if rf.getRole(true) == RoleLeader { // Candidate模式下，第一次发出去的选票可能没有结果，所以Candidate超时了也要重新发起选举
 			continue
 		}
 
@@ -562,18 +649,19 @@ func (rf *Raft) heartbeatTicker() {
 		} else {
 			atomic.StoreInt64(&rf.nextHeartbeatTimestamp, getNextHeartbeatTimestamp())
 		}
-		if rf.getRole() == RoleFollower || rf.getRole() == RoleCandidate {
+		if rf.getRole(true) == RoleFollower || rf.getRole(true) == RoleCandidate {
 			continue
 		}
 
 		go rf.broadcastHeartbeat()
 	}
+	DPrintf("%v heartbest exit because killed\n", rf.id)
 }
 
 func (rf *Raft) logReplicaWorker(peer int64) {
 	for rf.killed() == false {
 		time.Sleep(1 * time.Millisecond)
-		if rf.getRole() != RoleLeader {
+		if rf.getRole(true) != RoleLeader {
 			continue
 		}
 
@@ -586,8 +674,13 @@ func (rf *Raft) logReplicaWorker(peer int64) {
 		if len(entries) == 0 {
 			continue
 		}
+
+		curTerm := rf.checkLeaderAndGetCurrentTerm(true)
+		if curTerm == -1 {
+			continue
+		}
 		args := AppendEntriesArgs{
-			Term:         rf.getCurrentTerm(),
+			Term:         curTerm,
 			LeaderID:     rf.me,
 			PrevLogIndex: entries[0].Index,
 			PrevLogTerm:  entries[0].Term,
@@ -598,8 +691,9 @@ func (rf *Raft) logReplicaWorker(peer int64) {
 		rf.sendAppendEntries(int(peer), &args, &reply)
 
 		if reply.Term > rf.getCurrentTerm() {
-			rf.setTerm(reply.Term)
-			rf.tryBecomeFollower(reply.Term, peer)
+			rf.tryBecomeFollowerAndUpdateTerm(reply.Term, peer, true)
+			rf.persist(true)
+			DPrintf("\033[35m%d Update To Term %d because AE Reply from %d when rep log\033[0m\n", rf.me, reply.Term, peer)
 			continue
 		}
 
@@ -609,7 +703,7 @@ func (rf *Raft) logReplicaWorker(peer int64) {
 		} else {
 			if nextIdx > 1 {
 				rf.setNextIndex(peer, nextIdx-1)
-			} else if nextIdx == 1{
+			} else if nextIdx == 1 {
 				// 针对1的特殊处理，否则会导致TestBackup2B失败
 				continue
 			} else {
@@ -622,7 +716,7 @@ func (rf *Raft) logReplicaWorker(peer int64) {
 func (rf *Raft) logCommitWorker() {
 	for rf.killed() == false {
 		time.Sleep(1 * time.Millisecond)
-		if rf.getRole() != RoleLeader {
+		if rf.getRole(true) != RoleLeader {
 			continue
 		}
 
@@ -631,10 +725,10 @@ func (rf *Raft) logCommitWorker() {
 
 		n := rf.getLastLogIndex(true)
 
-		brk:
+	brk:
 		for n > nowCommited {
 			cnt := 1
-			for peer :=0; peer < len(rf.peers); peer++ {
+			for peer := 0; peer < len(rf.peers); peer++ {
 				if rf.getMatchIndex(int64(peer)) > n {
 					cnt++
 				}
@@ -649,6 +743,9 @@ func (rf *Raft) logCommitWorker() {
 						break brk
 					}
 					rf.setCommitIndex(n)
+
+					DPrintf("\033[31m%d commit log index %d term %d value %v\033[0m\n", rf.me, log.Index, log.Term, log.Data)
+
 					break brk
 				}
 			}
@@ -657,32 +754,32 @@ func (rf *Raft) logCommitWorker() {
 	}
 }
 
-
-
 func (rf *Raft) applyMsgWorker() {
 	for {
 		time.Sleep(1 * time.Millisecond)
 		newCommitIdx := rf.getCommitIndex()
 		// 下面循环的初始条件的+1是为了避免对idx=0的判断
-		for i:= rf.getLastApplyID()+1; i<=newCommitIdx; i++ {
+		for i := rf.getLastApplyID() + 1; i <= newCommitIdx; i++ {
 			log := rf.getLogByIndex(i, true)
 			if log == nil {
 				panic("Get log which is nil")
 			}
 			rf.applyCh <- ApplyMsg{
 				CommandValid: true,
-				Command: log.Data,
+				Command:      log.Data,
 				CommandIndex: int(log.Index),
 			}
 			rf.setLastApplyID(i)
+			DPrintf("\033[31m%d apply log index %d term %d value %v\033[0m\n", rf.me, log.Index, log.Term, log.Data)
 		}
 	}
 }
 
 func (rf *Raft) doElection() {
-	rf.setRole(RoleCandidate)
+	rf.setRole(RoleCandidate, true)
 	rf.incTerm()
 	rf.setVotedFor(int64(rf.me))
+	rf.persist(true)
 
 	recvVoteCnt := int64(1)
 	for i := 0; i < len(rf.peers); i++ {
@@ -716,22 +813,27 @@ func (rf *Raft) tryBecomeLeader(term int64) {
 	if term < rf.getCurrentTerm() || term > rf.getCurrentTerm() {
 		return
 	}
-	if rf.getRole() == RoleLeader {
+	if rf.getRole(true) == RoleLeader {
 		return
 	}
-	rf.setRole(RoleLeader)
+	rf.setRole(RoleLeader, true)
 }
 
-func (rf *Raft) tryBecomeFollower(term int64, triggerSrorce int64) {
+func (rf *Raft) tryBecomeFollower(term int64, triggerSrorce int64, lock bool) {
+	if lock {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+	}
+
 	if term < rf.getCurrentTerm() || term > rf.getCurrentTerm() {
 		return
 	}
-	if rf.getRole() == RoleFollower {
+	if rf.getRole(false) == RoleFollower {
 		return
 	}
-	if rf.getRole() != RoleFollower {
-		DPrintf("\033[31m[***] %d Turn To Follower From State %s At term %d, Because Server %d\033[0m\n", rf.me, rf.getRole(), rf.getCurrentTerm(), triggerSrorce)
-		rf.setRole(RoleFollower)
+	if rf.getRole(false) != RoleFollower {
+		DPrintf("\033[31m[***] %d Turn To Follower From State %s At term %d, Because Server %d\033[0m\n", rf.me, rf.getRole(false), rf.getCurrentTerm(), triggerSrorce)
+		rf.setRole(RoleFollower, false)
 	}
 }
 
@@ -742,8 +844,12 @@ func (rf *Raft) broadcastHeartbeat() {
 		}
 
 		go func(idx int) {
+			curTerm := rf.checkLeaderAndGetCurrentTerm(true)
+			if curTerm == -1 {
+				return
+			}
 			args := AppendEntriesArgs{
-				Term:         rf.getCurrentTerm(),
+				Term:         curTerm,
 				LeaderID:     rf.me,
 				PrevLogIndex: rf.getLastLogIndex(true),
 				PrevLogTerm:  rf.getLogTermByIndex(rf.getLastLogIndex(true), true),
@@ -752,8 +858,9 @@ func (rf *Raft) broadcastHeartbeat() {
 			reply := AppendEntriesReply{}
 			rf.sendAppendEntries(idx, &args, &reply)
 			if reply.Term > rf.getCurrentTerm() {
-				rf.setTerm(reply.Term)
-				rf.tryBecomeFollower(reply.Term, int64(idx))
+				rf.tryBecomeFollowerAndUpdateTerm(reply.Term, int64(idx), false)
+				rf.persist(true)
+				DPrintf("\033[35m%d Update To Term %d because Found New One from heartbeat response of %d\033[0m\n", rf.me, reply.Term, idx)
 			}
 		}(i)
 	}
@@ -794,26 +901,30 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.id = time.Now()
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.applyCh = applyCh
 	atomic.StoreInt64(&rf.nextVoteTimestamp, getNextVoteTimeoutTimestamp())
 	atomic.StoreInt64(&rf.nextHeartbeatTimestamp, getNextHeartbeatTimestamp())
+
+	x := time.Now()
 	rf.matchIndex = make([]int64, len(peers))
 	rf.nextIndex = make([]int64, len(peers))
 	// 这里追加一条空日志，占据logs下标为0的位置，作为dummy head 简化后续代码。实际raft的log都是从idx=1开始的
 	rf.logs = append(rf.logs, &LogEntry{})
-	rf.setRole(RoleFollower)
+	rf.setRole(RoleFollower, true)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	DPrintf("%d Restart Reading Uss %v", me, time.Since(x))
 	// start ticker goroutine to start elections
 	go rf.ticker()
 	go rf.heartbeatTicker()
 	go rf.logCommitWorker()
 	go rf.applyMsgWorker()
-	for i:=0; i<len(peers); i++ {
+	for i := 0; i < len(peers); i++ {
 		if i != me {
 			go rf.logReplicaWorker(int64(i))
 		}
