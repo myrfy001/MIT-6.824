@@ -744,6 +744,7 @@ func TestPersist32C(t *testing.T) {
 // haven't been committed yet.
 //
 func TestFigure82C(t *testing.T) {
+	fmt.Println("TestFigure82C Iter")
 	servers := 5
 	cfg := make_config(t, servers, false, false)
 	defer cfg.cleanup()
@@ -754,6 +755,7 @@ func TestFigure82C(t *testing.T) {
 
 	nup := servers
 	for iters := 0; iters < 1000; iters++ {
+		fmt.Println("TestFigure82C Iter", iters, "=====================================")
 		leader := -1
 		for i := 0; i < servers; i++ {
 			if cfg.rafts[i] != nil {
@@ -794,6 +796,7 @@ func TestFigure82C(t *testing.T) {
 		}
 	}
 
+	fmt.Println("TestFigure82C Last One check===================================")
 	cfg.one(rand.Int(), servers, true)
 
 	cfg.end()
@@ -839,14 +842,17 @@ func TestFigure8Unreliable2C(t *testing.T) {
 
 	nup := servers
 	for iters := 0; iters < 1000; iters++ {
+		fmt.Println("TestFigure8Unreliable2C", iters, "=====================================")
 		if iters == 200 {
 			cfg.setlongreordering(true)
+			fmt.Println("TestFigure8Unreliable2C setlongreordering", "=====================================")
 		}
 		leader := -1
 		for i := 0; i < servers; i++ {
 			_, _, ok := cfg.rafts[i].Start(rand.Int() % 10000)
 			if ok && cfg.connected[i] {
 				leader = i
+				fmt.Println("TestFigure8Unreliable2C Set leader = ", i, "=====================================")
 			}
 		}
 
@@ -861,12 +867,14 @@ func TestFigure8Unreliable2C(t *testing.T) {
 		if leader != -1 && (rand.Int()%1000) < int(RaftElectionTimeout/time.Millisecond)/2 {
 			cfg.disconnect(leader)
 			nup -= 1
+			fmt.Println("==== Disconnect Server", leader, "====")
 		}
 
 		if nup < 3 {
 			s := rand.Int() % servers
 			if cfg.connected[s] == false {
 				cfg.connect(s)
+				fmt.Println("==== Connect Server", s, "====")
 				nup += 1
 			}
 		}
@@ -875,9 +883,11 @@ func TestFigure8Unreliable2C(t *testing.T) {
 	for i := 0; i < servers; i++ {
 		if cfg.connected[i] == false {
 			cfg.connect(i)
+			fmt.Println("==== Connect Server", i, "====")
 		}
 	}
 
+	fmt.Println("==== Final Test ====")
 	cfg.one(rand.Int()%10000, servers, true)
 
 	cfg.end()

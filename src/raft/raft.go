@@ -446,6 +446,7 @@ func (rf *Raft) tryBecomeFollowerAndUpdateTerm(term int64, triggerSrorce int64, 
 	}
 	rf.setTerm(term)
 	rf.tryBecomeFollower(term, triggerSrorce, false)
+	atomic.StoreInt64(&rf.nextVoteTimestamp, getNextVoteTimeoutTimestamp())
 }
 
 func (rf *Raft) checkLeaderAndGetCurrentTerm(lock bool) int64 {
@@ -798,25 +799,31 @@ func (rf *Raft) doElection() {
 			rf.sendRequestVote(idx, &args, &reply)
 			if reply.VoteGranted {
 				newCnt := atomic.AddInt64(&recvVoteCnt, 1)
-				DPrintf("\033[33m%d Recv Vote From %d At term %d\033[0m\n", rf.me, idx, rf.getCurrentTerm())
+				DPrintf("\033[33m%d Recv Vote From %d For term %d, my cur term %d\033[0m\n", rf.me, idx, reply.Term, rf.getCurrentTerm())
 				if newCnt > int64(len(rf.peers))/2 {
-					DPrintf("\033[31m%d Win Election At term %d\033[0m\n", rf.me, rf.getCurrentTerm())
-					rf.tryBecomeLeader(reply.Term)
-					go rf.broadcastHeartbeat()
+					if rf.tryBecomeLeader(reply.Term, true) {
+						go rf.broadcastHeartbeat()
+					}
 				}
 			}
 		}(i)
 	}
 }
 
-func (rf *Raft) tryBecomeLeader(term int64) {
+func (rf *Raft) tryBecomeLeader(term int64, lock bool) bool {
+	if lock {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+	}
 	if term < rf.getCurrentTerm() || term > rf.getCurrentTerm() {
-		return
+		return false
 	}
-	if rf.getRole(true) == RoleLeader {
-		return
+	if rf.getRole(false) == RoleLeader {
+		return false
 	}
-	rf.setRole(RoleLeader, true)
+	rf.setRole(RoleLeader, false)
+	DPrintf("\033[31m%d Win Election At term %d\033[0m\n", rf.me, term)
+	return true
 }
 
 func (rf *Raft) tryBecomeFollower(term int64, triggerSrorce int64, lock bool) {
