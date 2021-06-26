@@ -130,6 +130,9 @@ func (rf *Raft) getNextIndex(peer int64) int64 {
 }
 
 func (rf *Raft) setNextIndex(peer int64, val int64) {
+	if val == 0 {
+		fmt.Println("111111")
+	}
 	atomic.StoreInt64(&rf.nextIndex[peer], val)
 }
 
@@ -349,6 +352,7 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int64
 	Success bool
+	NextIndexHint int64
 }
 
 //
@@ -386,6 +390,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	reply.Success = false
 	reply.Term = rf.getCurrentTerm()
+	reply.NextIndexHint = -1
 	if args.Term < rf.getCurrentTerm() {
 		return
 	}
@@ -407,9 +412,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	myPrevLog := rf.getLogByIndex(args.PrevLogIndex, true)
 	if myPrevLog == nil {
+		reply.NextIndexHint = rf.getLastLogIndex(true) + 1
+		if reply.NextIndexHint == -1 {
+			fmt.Println("yyyyyyyyyyyyy")
+		}
 		return
 	}
 	if myPrevLog.Term != args.PrevLogTerm {
+		reply.NextIndexHint = rf.findFirstIndexOfTermByLogIdx(args.PrevLogIndex, true)
+		if reply.NextIndexHint == -1 {
+			fmt.Println("zzzzzzzzzzzzzzzzzzzzzz")
+		}
 		return
 	}
 
@@ -428,9 +441,39 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if maxIndexOfMyselfLog < newCommitIdx {
 		newCommitIdx = maxIndexOfMyselfLog
 	}
+	if rf.getCommitIndex() != newCommitIdx {
+		DPrintf("\033[35m%d advanced commitIdx to %d because AE from %d term %d\033[0m\n", rf.me, newCommitIdx, args.LeaderID, args.Term)
+	}
 	rf.setCommitIndex(newCommitIdx)
 	rf.mu.Unlock()
 
+}
+
+func (rf *Raft) findFirstIndexOfTermByLogIdx(idx int64, lock bool) int64 {
+	if lock {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+	}
+	log := rf.getLogByIndex(idx, false)
+	if log == nil {
+		return rf.getLastLogIndex(false)
+	}
+	targetTerm := log.Term
+	if targetTerm == 1 {
+		return 1
+	}
+	idx --
+	for idx >= 2{
+		log := rf.getLogByIndex(idx, false)
+		if log == nil {
+			return rf.getLastLogIndex(false)
+		}
+		if log.Term < targetTerm {
+			return idx + 1
+		}
+		idx --
+	}
+	return 1
 }
 
 func (rf *Raft) tryBecomeFollowerAndUpdateTerm(term int64, triggerSrorce int64, lock bool) {
@@ -689,7 +732,11 @@ func (rf *Raft) logReplicaWorker(peer int64) {
 			LeaderCommit: rf.getCommitIndex(),
 		}
 		reply := AppendEntriesReply{}
-		rf.sendAppendEntries(int(peer), &args, &reply)
+		if !rf.sendAppendEntries(int(peer), &args, &reply) {
+			DPrintf("\033[36m%d Sent AE To %d at Term %d but timeout\033[0m\n", rf.me, peer, args.Term)
+			continue
+		}
+		
 
 		if reply.Term > rf.getCurrentTerm() {
 			rf.tryBecomeFollowerAndUpdateTerm(reply.Term, peer, true)
@@ -702,13 +749,16 @@ func (rf *Raft) logReplicaWorker(peer int64) {
 			rf.setNextIndex(peer, nextIdx+int64(len(entries)-1))
 			rf.setMatchIndex(peer, nextIdx+int64(len(entries)-1))
 		} else {
-			if nextIdx > 1 {
-				rf.setNextIndex(peer, nextIdx-1)
-			} else if nextIdx == 1 {
-				// 针对1的特殊处理，否则会导致TestBackup2B失败
-				continue
+			if reply.NextIndexHint != -1 {
+				if reply.NextIndexHint == 0 {
+					fmt.Println("===============|||||||||||")
+				}
+				rf.setNextIndex(peer, reply.NextIndexHint)
 			} else {
-				panic(fmt.Sprintf("nextIndex for peer %d reach 0", peer))
+				// Do Nothing
+				// 在AE的Handler中，如果因为网络问题，导致对方也误认为自己是Leader，且两者Term还相同的时候，对方会返回
+				// NextIndexHint = -1 且 Success = false的情况
+				// 这里有点凑巧，后面看看如何写的更优雅一些
 			}
 		}
 	}
@@ -763,7 +813,7 @@ func (rf *Raft) applyMsgWorker() {
 		for i := rf.getLastApplyID() + 1; i <= newCommitIdx; i++ {
 			log := rf.getLogByIndex(i, true)
 			if log == nil {
-				panic("Get log which is nil")
+				panic(fmt.Sprintf("%d Get log which is nil, log Idx = %d", rf.me, i))
 			}
 			rf.applyCh <- ApplyMsg{
 				CommandValid: true,
@@ -796,7 +846,10 @@ func (rf *Raft) doElection() {
 				LastLogTerm:  rf.getLogTermByIndex(rf.getLastLogIndex(true), true),
 			}
 			reply := RequestVoteReply{}
-			rf.sendRequestVote(idx, &args, &reply)
+			if !rf.sendRequestVote(idx, &args, &reply) {
+				DPrintf("\033[33m%d Send RV to %d at Term %d but timeout\033[0m\n", rf.me, idx, args.Term)
+				return
+			}
 			if reply.VoteGranted {
 				newCnt := atomic.AddInt64(&recvVoteCnt, 1)
 				DPrintf("\033[33m%d Recv Vote From %d For term %d, my cur term %d\033[0m\n", rf.me, idx, reply.Term, rf.getCurrentTerm())
@@ -863,7 +916,10 @@ func (rf *Raft) broadcastHeartbeat() {
 				LeaderCommit: rf.commitIndex,
 			}
 			reply := AppendEntriesReply{}
-			rf.sendAppendEntries(idx, &args, &reply)
+			if !rf.sendAppendEntries(idx, &args, &reply) {
+				DPrintf("\033[36m%d Send Hearbeat to %d at Term %d but timeout\033[0m\n", rf.me, idx, args.Term)
+				return
+			}
 			if reply.Term > rf.getCurrentTerm() {
 				rf.tryBecomeFollowerAndUpdateTerm(reply.Term, int64(idx), false)
 				rf.persist(true)
